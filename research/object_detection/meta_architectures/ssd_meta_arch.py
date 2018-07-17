@@ -139,7 +139,8 @@ class SSDMetaArch(model.DetectionModel):
                normalize_loc_loss_by_codesize=False,
                freeze_batchnorm=False,
                inplace_batchnorm_update=False,
-               add_background_class=True):
+               add_background_class=True,
+               random_example_sampler=None):
     """SSDMetaArch Constructor.
 
     TODO(rathodv,jonathanhuang): group NMS parameters + score converter into
@@ -198,6 +199,12 @@ class SSDMetaArch(model.DetectionModel):
         one-hot encodings of groundtruth labels. Set to false if using
         groundtruth labels with an explicit background class or using multiclass
         scores instead of truth in the case of distillation.
+      random_example_sampler: a BalancedPositiveNegativeSampler object that can
+        perform random example sampling when computing loss. If None, random
+        sampling process is skipped. Note that random example sampler and hard
+        example miner can both be applied to the model. In that case, random
+        sampler will take effect first and hard example miner can only process
+        the random sampled examples.
     """
     super(SSDMetaArch, self).__init__(num_classes=box_predictor.num_classes)
     self._is_training = is_training
@@ -240,6 +247,8 @@ class SSDMetaArch(model.DetectionModel):
     self._normalize_loss_by_num_matches = normalize_loss_by_num_matches
     self._normalize_loc_loss_by_codesize = normalize_loc_loss_by_codesize
     self._hard_example_miner = hard_example_miner
+    self._random_example_sampler = random_example_sampler
+    self._parallel_iterations = 16
 
     self._image_resizer_fn = image_resizer_fn
     self._non_max_suppression_fn = non_max_suppression_fn
@@ -393,8 +402,9 @@ class SSDMetaArch(model.DetectionModel):
               im_width=image_shape[2]))
       prediction_dict = self._box_predictor.predict(
           feature_maps, self._anchor_generator.num_anchors_per_location())
-      box_encodings = tf.squeeze(
-          tf.concat(prediction_dict['box_encodings'], axis=1), axis=2)
+      box_encodings = tf.concat(prediction_dict['box_encodings'], axis=1)
+      if box_encodings.shape.ndims == 4 and box_encodings.shape[2] == 1:
+        box_encodings = tf.squeeze(box_encodings, axis=2)
       class_predictions_with_background = tf.concat(
           prediction_dict['class_predictions_with_background'], axis=1)
       predictions_dict = {
@@ -470,12 +480,16 @@ class SSDMetaArch(model.DetectionModel):
     with tf.name_scope('Postprocessor'):
       preprocessed_images = prediction_dict['preprocessed_inputs']
       box_encodings = prediction_dict['box_encodings']
+      box_encodings = tf.identity(box_encodings, 'raw_box_encodings')
       class_predictions = prediction_dict['class_predictions_with_background']
       detection_boxes, detection_keypoints = self._batch_decode(box_encodings)
+      detection_boxes = tf.identity(detection_boxes, 'raw_box_locations')
       detection_boxes = tf.expand_dims(detection_boxes, axis=2)
 
       detection_scores_with_background = self._score_conversion_fn(
           class_predictions)
+      detection_scores_with_background = tf.identity(
+          detection_scores_with_background, 'raw_box_scores')
       detection_scores = tf.slice(detection_scores_with_background, [0, 0, 1],
                                   [-1, -1, -1])
       additional_fields = None
@@ -543,6 +557,20 @@ class SSDMetaArch(model.DetectionModel):
       if self._add_summaries:
         self._summarize_target_assignment(
             self.groundtruth_lists(fields.BoxListFields.boxes), match_list)
+
+      if self._random_example_sampler:
+        batch_sampled_indicator = tf.to_float(
+            shape_utils.static_or_dynamic_map_fn(
+                self._minibatch_subsample_fn,
+                [batch_cls_targets, batch_cls_weights],
+                dtype=tf.bool,
+                parallel_iterations=self._parallel_iterations,
+                back_prop=True))
+        batch_reg_weights = tf.multiply(batch_sampled_indicator,
+                                        batch_reg_weights)
+        batch_cls_weights = tf.multiply(batch_sampled_indicator,
+                                        batch_cls_weights)
+
       location_losses = self._localization_loss(
           prediction_dict['box_encodings'],
           batch_reg_targets,
@@ -592,6 +620,32 @@ class SSDMetaArch(model.DetectionModel):
           str(classification_loss.op.name): classification_loss
       }
     return loss_dict
+
+  def _minibatch_subsample_fn(self, inputs):
+    """Randomly samples anchors for one image.
+
+    Args:
+      inputs: a list of 2 inputs. First one is a tensor of shape [num_anchors,
+        num_classes] indicating targets assigned to each anchor. Second one
+        is a tensor of shape [num_anchors] indicating the class weight of each
+        anchor.
+
+    Returns:
+      batch_sampled_indicator: bool tensor of shape [num_anchors] indicating
+        whether the anchor should be selected for loss computation.
+    """
+    cls_targets, cls_weights = inputs
+    if self._add_background_class:
+      # Set background_class bits to 0 so that the positives_indicator
+      # computation would not consider background class.
+      background_class = tf.zeros_like(tf.slice(cls_targets, [0, 0], [-1, 1]))
+      regular_class = tf.slice(cls_targets, [0, 1], [-1, -1])
+      cls_targets = tf.concat([background_class, regular_class], 1)
+    positives_indicator = tf.reduce_sum(cls_targets, axis=1)
+    return self._random_example_sampler.subsample(
+        tf.cast(cls_weights, tf.bool),
+        batch_size=None,
+        labels=tf.cast(positives_indicator, tf.bool))
 
   def _summarize_anchor_classification_loss(self, class_ids, cls_losses):
     positive_indices = tf.where(tf.greater(class_ids, 0))
@@ -790,8 +844,8 @@ class SSDMetaArch(model.DetectionModel):
         classification checkpoint for initialization prior to training.
         Valid values: `detection`, `classification`. Default 'detection'.
       load_all_detection_checkpoint_vars: whether to load all variables (when
-         `from_detection_checkpoint` is True). If False, only variables within
-         the appropriate scopes are included. Default False.
+         `fine_tune_checkpoint_type='detection'`). If False, only variables
+         within the appropriate scopes are included. Default False.
 
     Returns:
       A dict mapping variable names (to load from a checkpoint) to variables in

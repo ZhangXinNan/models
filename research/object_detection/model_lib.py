@@ -25,6 +25,7 @@ import tensorflow as tf
 
 from object_detection import eval_util
 from object_detection import inputs
+from object_detection.builders import graph_rewriter_builder
 from object_detection.builders import model_builder
 from object_detection.builders import optimizer_builder
 from object_detection.core import standard_fields as fields
@@ -48,8 +49,8 @@ MODEL_BUILD_UTIL_MAP = {
 }
 
 
-def _get_groundtruth_data(detection_model, class_agnostic):
-  """Extracts groundtruth data from detection_model.
+def _prepare_groundtruth_for_eval(detection_model, class_agnostic):
+  """Extracts groundtruth data from detection_model and prepares it for eval.
 
   Args:
     detection_model: A `DetectionModel` object.
@@ -63,6 +64,8 @@ def _get_groundtruth_data(detection_model, class_agnostic):
       'groundtruth_classes': [num_boxes] int64 tensor of 1-indexed classes.
       'groundtruth_masks': 3D float32 tensor of instance masks (if provided in
         groundtruth)
+      'groundtruth_is_crowd': [num_boxes] bool tensor indicating is_crowd
+        annotations (if provided in groundtruth).
     class_agnostic: Boolean indicating whether detections are class agnostic.
   """
   input_data_fields = fields.InputDataFields()
@@ -86,6 +89,9 @@ def _get_groundtruth_data(detection_model, class_agnostic):
   if detection_model.groundtruth_has_field(fields.BoxListFields.masks):
     groundtruth[input_data_fields.groundtruth_instance_masks] = (
         detection_model.groundtruth_lists(fields.BoxListFields.masks)[0])
+  if detection_model.groundtruth_has_field(fields.BoxListFields.is_crowd):
+    groundtruth[input_data_fields.groundtruth_is_crowd] = (
+        detection_model.groundtruth_lists(fields.BoxListFields.is_crowd)[0])
   return groundtruth
 
 
@@ -93,7 +99,7 @@ def unstack_batch(tensor_dict, unpad_groundtruth_tensors=True):
   """Unstacks all tensors in `tensor_dict` along 0th dimension.
 
   Unstacks tensor from the tensor dict along 0th dimension and returns a
-  tensor_dict containing values that are lists of unstacked tensors.
+  tensor_dict containing values that are lists of unstacked, unpadded tensors.
 
   Tensors in the `tensor_dict` are expected to be of one of the three shapes:
   1. [batch_size]
@@ -224,19 +230,23 @@ def create_model_fn(detection_model_fn, configs, hparams, use_tpu=False):
       gt_keypoints_list = None
       if fields.InputDataFields.groundtruth_keypoints in labels:
         gt_keypoints_list = labels[fields.InputDataFields.groundtruth_keypoints]
+      if fields.InputDataFields.groundtruth_is_crowd in labels:
+        gt_is_crowd_list = labels[fields.InputDataFields.groundtruth_is_crowd]
       detection_model.provide_groundtruth(
           groundtruth_boxes_list=gt_boxes_list,
           groundtruth_classes_list=gt_classes_list,
           groundtruth_masks_list=gt_masks_list,
           groundtruth_keypoints_list=gt_keypoints_list,
           groundtruth_weights_list=labels[
-              fields.InputDataFields.groundtruth_weights])
+              fields.InputDataFields.groundtruth_weights],
+          groundtruth_is_crowd_list=gt_is_crowd_list)
 
     preprocessed_images = features[fields.InputDataFields.image]
     prediction_dict = detection_model.predict(
         preprocessed_images, features[fields.InputDataFields.true_image_shape])
-    detections = detection_model.postprocess(
-        prediction_dict, features[fields.InputDataFields.true_image_shape])
+    if mode in (tf.estimator.ModeKeys.EVAL, tf.estimator.ModeKeys.PREDICT):
+      detections = detection_model.postprocess(
+          prediction_dict, features[fields.InputDataFields.true_image_shape])
 
     if mode == tf.estimator.ModeKeys.TRAIN:
       if train_config.fine_tune_checkpoint and hparams.load_pretrained:
@@ -281,7 +291,11 @@ def create_model_fn(detection_model_fn, configs, hparams, use_tpu=False):
       total_loss = tf.add_n(losses, name='total_loss')
       losses_dict['Loss/total_loss'] = total_loss
 
-    if mode in [tf.estimator.ModeKeys.TRAIN, tf.estimator.ModeKeys.EVAL]:
+      if 'graph_rewriter_config' in configs:
+        graph_rewriter_fn = graph_rewriter_builder.build(
+            configs['graph_rewriter_config'], is_training=is_training)
+        graph_rewriter_fn()
+
       # TODO(rathodv): Stop creating optimizer summary vars in EVAL mode once we
       # can write learning rate summaries on TPU without host calls.
       global_step = tf.train.get_or_create_global_step()
@@ -325,21 +339,23 @@ def create_model_fn(detection_model_fn, configs, hparams, use_tpu=False):
       }
 
     eval_metric_ops = None
-    if mode in (tf.estimator.ModeKeys.TRAIN, tf.estimator.ModeKeys.EVAL):
+    scaffold = None
+    if mode == tf.estimator.ModeKeys.EVAL:
       class_agnostic = (fields.DetectionResultFields.detection_classes
                         not in detections)
-      groundtruth = _get_groundtruth_data(detection_model, class_agnostic)
+      groundtruth = _prepare_groundtruth_for_eval(
+          detection_model, class_agnostic)
       use_original_images = fields.InputDataFields.original_image in features
-      original_images = (
+      eval_images = (
           features[fields.InputDataFields.original_image] if use_original_images
           else features[fields.InputDataFields.image])
       eval_dict = eval_util.result_dict_for_single_example(
-          original_images[0:1],
+          eval_images[0:1],
           features[inputs.HASH_KEY][0],
           detections,
           groundtruth,
           class_agnostic=class_agnostic,
-          scale_to_absolute=False)
+          scale_to_absolute=True)
 
       if class_agnostic:
         category_index = label_map_util.create_class_agnostic_category_index()
@@ -351,28 +367,41 @@ def create_model_fn(detection_model_fn, configs, hparams, use_tpu=False):
         detection_and_groundtruth = (
             vis_utils.draw_side_by_side_evaluation_image(
                 eval_dict, category_index, max_boxes_to_draw=20,
-                min_score_thresh=0.2))
+                min_score_thresh=0.2,
+                use_normalized_coordinates=False))
         img_summary = tf.summary.image('Detections_Left_Groundtruth_Right',
                                        detection_and_groundtruth)
 
-      if mode == tf.estimator.ModeKeys.EVAL:
-        # Eval metrics on a single example.
-        eval_metrics = eval_config.metrics_set
-        if not eval_metrics:
-          eval_metrics = ['coco_detection_metrics']
-        eval_metric_ops = eval_util.get_eval_metric_ops_for_evaluators(
-            eval_metrics, category_index.values(), eval_dict,
-            include_metrics_per_category=False)
-        for loss_key, loss_tensor in iter(losses_dict.items()):
-          eval_metric_ops[loss_key] = tf.metrics.mean(loss_tensor)
-        for var in optimizer_summary_vars:
-          eval_metric_ops[var.op.name] = (var, tf.no_op())
-        if img_summary is not None:
-          eval_metric_ops['Detections_Left_Groundtruth_Right'] = (
-              img_summary, tf.no_op())
-        eval_metric_ops = {str(k): v for k, v in eval_metric_ops.iteritems()}
+      # Eval metrics on a single example.
+      eval_metrics = eval_config.metrics_set
+      if not eval_metrics:
+        eval_metrics = ['coco_detection_metrics']
+      eval_metric_ops = eval_util.get_eval_metric_ops_for_evaluators(
+          eval_metrics,
+          category_index.values(),
+          eval_dict,
+          include_metrics_per_category=eval_config.include_metrics_per_category)
+      for loss_key, loss_tensor in iter(losses_dict.items()):
+        eval_metric_ops[loss_key] = tf.metrics.mean(loss_tensor)
+      for var in optimizer_summary_vars:
+        eval_metric_ops[var.op.name] = (var, tf.no_op())
+      if img_summary is not None:
+        eval_metric_ops['Detections_Left_Groundtruth_Right'] = (
+            img_summary, tf.no_op())
+      eval_metric_ops = {str(k): v for k, v in eval_metric_ops.iteritems()}
 
-    if use_tpu:
+      if eval_config.use_moving_averages:
+        variable_averages = tf.train.ExponentialMovingAverage(0.0)
+        variables_to_restore = variable_averages.variables_to_restore()
+        keep_checkpoint_every_n_hours = (
+            train_config.keep_checkpoint_every_n_hours)
+        saver = tf.train.Saver(
+            variables_to_restore,
+            keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours)
+        scaffold = tf.train.Scaffold(saver=saver)
+
+    # EVAL executes on CPU, so use regular non-TPU EstimatorSpec.
+    if use_tpu and mode != tf.estimator.ModeKeys.EVAL:
       return tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode,
           scaffold_fn=scaffold_fn,
@@ -388,7 +417,8 @@ def create_model_fn(detection_model_fn, configs, hparams, use_tpu=False):
           loss=total_loss,
           train_op=train_op,
           eval_metric_ops=eval_metric_ops,
-          export_outputs=export_outputs)
+          export_outputs=export_outputs,
+          scaffold=scaffold)
 
   return model_fn
 
@@ -462,6 +492,7 @@ def create_estimator_and_inputs(run_config,
       hparams,
       train_steps=train_steps,
       eval_steps=eval_steps,
+      retain_original_images_in_eval=False if use_tpu else True,
       **kwargs)
   model_config = configs['model']
   train_config = configs['train_config']
@@ -469,11 +500,13 @@ def create_estimator_and_inputs(run_config,
   eval_config = configs['eval_config']
   eval_input_config = configs['eval_input_config']
 
-  if train_steps is None:
-    train_steps = configs['train_config'].num_steps
+  # update train_steps from config but only when non-zero value is provided
+  if train_steps is None and train_config.num_steps != 0:
+    train_steps = train_config.num_steps
 
-  if eval_steps is None:
-    eval_steps = configs['eval_config'].num_examples
+  # update eval_steps from config but only when non-zero value is provided
+  if eval_steps is None and eval_config.num_examples != 0:
+    eval_steps = eval_config.num_examples
 
   detection_model_fn = functools.partial(
       model_builder.build, model_config=model_config)
@@ -491,8 +524,10 @@ def create_estimator_and_inputs(run_config,
       eval_config=eval_config,
       eval_input_config=train_input_config,
       model_config=model_config)
-  predict_input_fn = create_predict_input_fn(model_config=model_config)
+  predict_input_fn = create_predict_input_fn(
+      model_config=model_config, predict_input_config=eval_input_config)
 
+  tf.logging.info('create_estimator_and_inputs: use_tpu %s', use_tpu)
   model_fn = model_fn_creator(detection_model_fn, configs, hparams, use_tpu)
   if use_tpu_estimator:
     estimator = tf.contrib.tpu.TPUEstimator(
@@ -502,6 +537,7 @@ def create_estimator_and_inputs(run_config,
         eval_batch_size=num_shards * 1 if use_tpu else 1,
         use_tpu=use_tpu,
         config=run_config,
+        # TODO(lzc): Remove conditional after CMLE moves to TF 1.9
         params=params if params else {})
   else:
     estimator = tf.estimator.Estimator(model_fn=model_fn, config=run_config)
@@ -529,6 +565,7 @@ def create_train_and_eval_specs(train_input_fn,
                                 train_steps,
                                 eval_steps,
                                 eval_on_train_data=False,
+                                eval_on_train_steps=None,
                                 final_exporter_name='Servo',
                                 eval_spec_name='eval'):
   """Creates a `TrainSpec` and `EvalSpec`s.
@@ -543,6 +580,8 @@ def create_train_and_eval_specs(train_input_fn,
     eval_steps: Number of eval steps.
     eval_on_train_data: Whether to evaluate model on training data. Default is
       False.
+    eval_on_train_steps: Number of eval steps for training data. If not given,
+      uses eval_steps.
     final_exporter_name: String name given to `FinalExporter`.
     eval_spec_name: String name given to main `EvalSpec`.
 
@@ -570,7 +609,7 @@ def create_train_and_eval_specs(train_input_fn,
     eval_specs.append(
         tf.estimator.EvalSpec(
             name='eval_on_train', input_fn=eval_on_train_input_fn,
-            steps=eval_steps))
+            steps=eval_on_train_steps or eval_steps))
 
   return train_spec, eval_specs
 
