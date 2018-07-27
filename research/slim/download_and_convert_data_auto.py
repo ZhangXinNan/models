@@ -45,12 +45,12 @@ FLAGS = tf.app.flags.FLAGS
 
 tf.app.flags.DEFINE_string(
     'dataset_name',
-    None,
+    'flowers',
     'The name of the dataset to convert, one of "cifar10", "flowers", "mnist".')
 
 tf.app.flags.DEFINE_string(
     'dataset_dir',
-    None,
+    'd:/data_public/slim',
     'The directory where the output TFRecords and temporary files are saved.')
 
 
