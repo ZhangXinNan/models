@@ -12,31 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Converts ImageNet data to TFRecords file format with Example protos.
+"""Converts image data to TFRecords file format with Example protos.
 
-The raw ImageNet data set is expected to reside in JPEG files located in the
+The image data set is expected to reside in JPEG files located in the
 following directory structure.
 
-  data_dir/n01440764/ILSVRC2012_val_00000293.JPEG
-  data_dir/n01440764/ILSVRC2012_val_00000543.JPEG
+  data_dir/label_0/image0.jpeg
+  data_dir/label_0/image1.jpg
+  ...
+  data_dir/label_1/weird-image.jpeg
+  data_dir/label_1/my-image.jpeg
   ...
 
-where 'n01440764' is the unique synset label associated with
-these images.
-
-The training data set consists of 1000 sub-directories (i.e. labels)
-each containing 1200 JPEG images for a total of 1.2M JPEG images.
-
-The evaluation data set consists of 1000 sub-directories (i.e. labels)
-each containing 50 JPEG images for a total of 50K JPEG images.
+where the sub-directory is the unique label associated with these images.
 
 This TensorFlow script converts the training and evaluation data into
-a sharded data set consisting of 1024 and 128 TFRecord files, respectively.
+a sharded data set consisting of TFRecord files
 
   train_directory/train-00000-of-01024
   train_directory/train-00001-of-01024
   ...
-  train_directory/train-00127-of-01024
+  train_directory/train-01023-of-01024
 
 and
 
@@ -45,42 +41,26 @@ and
   ...
   validation_directory/validation-00127-of-00128
 
-Each validation TFRecord file contains ~390 records. Each training TFREcord
-file contains ~1250 records. Each record within the TFRecord file is a
-serialized Example proto. The Example proto contains the following fields:
+where we have selected 1024 and 128 shards for each data set. Each record
+within the TFRecord file is a serialized Example proto. The Example proto
+contains the following fields:
 
   image/encoded: string containing JPEG encoded image in RGB colorspace
   image/height: integer, image height in pixels
   image/width: integer, image width in pixels
   image/colorspace: string, specifying the colorspace, always 'RGB'
   image/channels: integer, specifying the number of channels, always 3
-  image/format: string, specifying the format, always'JPEG'
+  image/format: string, specifying the format, always 'JPEG'
 
   image/filename: string containing the basename of the image file
             e.g. 'n01440764_10026.JPEG' or 'ILSVRC2012_val_00000293.JPEG'
   image/class/label: integer specifying the index in a classification layer.
-    The label ranges from [1, 1000] where 0 is not used.
-  image/class/synset: string specifying the unique ID of the label,
-    e.g. 'n01440764'
+    The label ranges from [0, num_labels] where 0 is unused and left as
+    the background class.
   image/class/text: string specifying the human-readable version of the label
-    e.g. 'red fox, Vulpes vulpes'
+    e.g. 'dog'
 
-  image/object/bbox/xmin: list of integers specifying the 0+ human annotated
-    bounding boxes
-  image/object/bbox/xmax: list of integers specifying the 0+ human annotated
-    bounding boxes
-  image/object/bbox/ymin: list of integers specifying the 0+ human annotated
-    bounding boxes
-  image/object/bbox/ymax: list of integers specifying the 0+ human annotated
-    bounding boxes
-  image/object/bbox/label: integer specifying the index in a classification
-    layer. The label ranges from [1, 1000] where 0 is not used. Note this is
-    always identical to the image label.
-
-Note that the length of xmin is identical to the length of xmax, ymin and ymax
-for each example.
-
-Running this script using 16 threads may take around ~2.5 hours on a HP Z420.
+If your data set involves bounding boxes, please look at build_imagenet_data.py.
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -93,9 +73,7 @@ import sys
 import threading
 
 import numpy as np
-from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
-
 
 tf.app.flags.DEFINE_string('train_directory', '/tmp/',
                            'Training data directory')
@@ -114,44 +92,13 @@ tf.app.flags.DEFINE_integer('num_threads', 8,
 
 # The labels file contains a list of valid labels are held in this file.
 # Assumes that the file contains entries as such:
-#   n01440764
-#   n01443537
-#   n01484850
-# where each line corresponds to a label expressed as a synset. We map
-# each synset contained in the file to an integer (based on the alphabetical
-# ordering). See below for details.
-tf.app.flags.DEFINE_string('labels_file',
-                           'imagenet_lsvrc_2015_synsets.txt',
-                           'Labels file')
+#   dog
+#   cat
+#   flower
+# where each line corresponds to a label. We map each label contained in
+# the file to an integer corresponding to the line number starting from 0.
+tf.app.flags.DEFINE_string('labels_file', '', 'Labels file')
 
-# This file containing mapping from synset to human-readable label.
-# Assumes each line of the file looks like:
-#
-#   n02119247    black fox
-#   n02119359    silver fox
-#   n02119477    red fox, Vulpes fulva
-#
-# where each line corresponds to a unique mapping. Note that each line is
-# formatted as <synset>\t<human readable label>.
-tf.app.flags.DEFINE_string('imagenet_metadata_file',
-                           'imagenet_metadata.txt',
-                           'ImageNet metadata file')
-
-# This file is the output of process_bounding_box.py
-# Assumes each line of the file looks like:
-#
-#   n00007846_64193.JPEG,0.0060,0.2620,0.7545,0.9940
-#
-# where each line corresponds to one bounding box annotation associated
-# with an image. Each line can be parsed as:
-#
-#   <JPEG file name>, <xmin>, <ymin>, <xmax>, <ymax>
-#
-# Note that there might exist mulitple bounding box annotations associated
-# with an image file.
-# tf.app.flags.DEFINE_string('bounding_box_file',
-#                            './imagenet_2012_bounding_boxes.csv',
-#                            'Bounding box file')
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -163,33 +110,25 @@ def _int64_feature(value):
   return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
 
 
-def _float_feature(value):
-  """Wrapper for inserting float features into Example proto."""
-  if not isinstance(value, list):
-    value = [value]
-  return tf.train.Feature(float_list=tf.train.FloatList(value=value))
-
-
 def _bytes_feature(value):
   """Wrapper for inserting bytes features into Example proto."""
   return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
 
 
-def _convert_to_example_auto(filename, image_buffer, label, synset, human,
-                        height, width):
+def _convert_to_example(filename, image_buffer, label, text, height, width):
   """Build an Example proto for an example.
 
   Args:
     filename: string, path to an image file, e.g., '/path/to/example.JPG'
     image_buffer: string, JPEG encoding of RGB image
     label: integer, identifier for the ground truth for the network
-    synset: string, unique WordNet ID specifying the label, e.g., 'n02323233'
-    human: string, human-readable label, e.g., 'red fox, Vulpes vulpes'
+    text: string, unique human-readable, e.g. 'dog'
     height: integer, image height in pixels
     width: integer, image width in pixels
   Returns:
     Example proto
   """
+
   colorspace = 'RGB'
   channels = 3
   image_format = 'JPEG'
@@ -200,8 +139,7 @@ def _convert_to_example_auto(filename, image_buffer, label, synset, human,
       'image/colorspace': _bytes_feature(tf.compat.as_bytes(colorspace)),
       'image/channels': _int64_feature(channels),
       'image/class/label': _int64_feature(label),
-      # 'image/class/synset': _bytes_feature(tf.compat.as_bytes(synset),
-      'image/class/text': _bytes_feature(tf.compat.as_bytes(human)),
+      'image/class/text': _bytes_feature(tf.compat.as_bytes(text)),
       'image/format': _bytes_feature(tf.compat.as_bytes(image_format)),
       'image/filename': _bytes_feature(tf.compat.as_bytes(os.path.basename(filename))),
       'image/encoded': _bytes_feature(tf.compat.as_bytes(image_buffer))}))
@@ -220,11 +158,6 @@ class ImageCoder(object):
     image = tf.image.decode_png(self._png_data, channels=3)
     self._png_to_jpeg = tf.image.encode_jpeg(image, format='rgb', quality=100)
 
-    # Initializes function that converts CMYK JPEG data to RGB JPEG data.
-    self._cmyk_data = tf.placeholder(dtype=tf.string)
-    image = tf.image.decode_jpeg(self._cmyk_data, channels=0)
-    self._cmyk_to_rgb = tf.image.encode_jpeg(image, format='rgb', quality=100)
-
     # Initializes function that decodes RGB JPEG data.
     self._decode_jpeg_data = tf.placeholder(dtype=tf.string)
     self._decode_jpeg = tf.image.decode_jpeg(self._decode_jpeg_data, channels=3)
@@ -232,10 +165,6 @@ class ImageCoder(object):
   def png_to_jpeg(self, image_data):
     return self._sess.run(self._png_to_jpeg,
                           feed_dict={self._png_data: image_data})
-
-  def cmyk_to_rgb(self, image_data):
-    return self._sess.run(self._cmyk_to_rgb,
-                          feed_dict={self._cmyk_data: image_data})
 
   def decode_jpeg(self, image_data):
     image = self._sess.run(self._decode_jpeg,
@@ -254,34 +183,7 @@ def _is_png(filename):
   Returns:
     boolean indicating if the image is a PNG.
   """
-  # File list from:
-  # https://groups.google.com/forum/embed/?place=forum/torch7#!topic/torch7/fOSTXHIESSU
-  return 'n02105855_2933.JPEG' in filename
-
-
-def _is_cmyk(filename):
-  """Determine if file contains a CMYK JPEG format image.
-
-  Args:
-    filename: string, path of the image file.
-
-  Returns:
-    boolean indicating if the image is a JPEG encoded with CMYK color space.
-  """
-  # File list from:
-  # https://github.com/cytsai/ilsvrc-cmyk-image-list
-  blacklist = ['n01739381_1309.JPEG', 'n02077923_14822.JPEG',
-               'n02447366_23489.JPEG', 'n02492035_15739.JPEG',
-               'n02747177_10752.JPEG', 'n03018349_4028.JPEG',
-               'n03062245_4620.JPEG', 'n03347037_9675.JPEG',
-               'n03467068_12171.JPEG', 'n03529860_11437.JPEG',
-               'n03544143_17228.JPEG', 'n03633091_5218.JPEG',
-               'n03710637_5125.JPEG', 'n03961711_5286.JPEG',
-               'n04033995_2932.JPEG', 'n04258138_17003.JPEG',
-               'n04264628_27969.JPEG', 'n04336792_7448.JPEG',
-               'n04371774_5854.JPEG', 'n04596742_4225.JPEG',
-               'n07583066_647.JPEG', 'n13037406_4650.JPEG']
-  return filename.split('/')[-1] in blacklist
+  return filename.endswith('.png')
 
 
 def _process_image(filename, coder):
@@ -296,17 +198,13 @@ def _process_image(filename, coder):
     width: integer, image width in pixels.
   """
   # Read the image file.
-  image_data = tf.gfile.FastGFile(filename, 'rb').read()
+  with tf.gfile.FastGFile(filename, 'rb') as f:
+    image_data = f.read()
 
-  # Clean the dirty data.
+  # Convert any PNG to JPEG's for consistency.
   if _is_png(filename):
-    # 1 image is a PNG.
     print('Converting PNG to JPEG for %s' % filename)
     image_data = coder.png_to_jpeg(image_data)
-  elif _is_cmyk(filename):
-    # 22 JPEG images are in CMYK colorspace.
-    print('Converting CMYK to RGB for %s' % filename)
-    image_data = coder.cmyk_to_rgb(image_data)
 
   # Decode the RGB JPEG.
   image = coder.decode_jpeg(image_data)
@@ -320,9 +218,8 @@ def _process_image(filename, coder):
   return image_data, height, width
 
 
-
-def _process_image_files_batch_auto(coder, thread_index, ranges, name, filenames,
-                               synsets, labels, humans, num_shards):
+def _process_image_files_batch(coder, thread_index, ranges, name, filenames,
+                               texts, labels, num_shards):
   """Processes and saves list of images as TFRecord in 1 thread.
 
   Args:
@@ -332,9 +229,8 @@ def _process_image_files_batch_auto(coder, thread_index, ranges, name, filenames
       analyze in parallel.
     name: string, unique identifier specifying the data set
     filenames: list of strings; each string is a path to an image file
-    synsets: list of strings; each string is a unique WordNet ID
+    texts: list of strings; each string is human readable, e.g. 'dog'
     labels: list of integer; each integer identifies the ground truth
-    humans: list of strings; each string is a human-readable label
     num_shards: integer number of shards for this data set.
   """
   # Each thread produces N shards where N = int(num_shards / num_threads).
@@ -350,7 +246,7 @@ def _process_image_files_batch_auto(coder, thread_index, ranges, name, filenames
   num_files_in_thread = ranges[thread_index][1] - ranges[thread_index][0]
 
   counter = 0
-  for s in xrange(num_shards_per_batch):
+  for s in range(num_shards_per_batch):
     # Generate a sharded version of the file name, e.g. 'train-00002-of-00010'
     shard = thread_index * num_shards_per_batch + s
     output_filename = '%s-%.5d-of-%.5d' % (name, shard, num_shards)
@@ -362,14 +258,17 @@ def _process_image_files_batch_auto(coder, thread_index, ranges, name, filenames
     for i in files_in_shard:
       filename = filenames[i]
       label = labels[i]
-      synset = synsets[i]
-      human = humans[i]
+      text = texts[i]
 
-      image_buffer, height, width = _process_image(filename, coder)
+      try:
+        image_buffer, height, width = _process_image(filename, coder)
+      except Exception as e:
+        print(e)
+        print('SKIPPED: Unexpected error while decoding %s.' % filename)
+        continue
 
-      example = _convert_to_example_auto(filename, image_buffer, label,
-                                    synset, human,
-                                    height, width)
+      example = _convert_to_example(filename, image_buffer, label,
+                                    text, height, width)
       writer.write(example.SerializeToString())
       shard_counter += 1
       counter += 1
@@ -389,29 +288,24 @@ def _process_image_files_batch_auto(coder, thread_index, ranges, name, filenames
   sys.stdout.flush()
 
 
-
-def _process_image_files_auto(name, filenames, synsets, labels, humans,
-                         num_shards):
+def _process_image_files(name, filenames, texts, labels, num_shards):
   """Process and save list of images as TFRecord of Example protos.
 
   Args:
     name: string, unique identifier specifying the data set
     filenames: list of strings; each string is a path to an image file
-    synsets: list of strings; each string is a unique WordNet ID
+    texts: list of strings; each string is human readable, e.g. 'dog'
     labels: list of integer; each integer identifies the ground truth
-    humans: list of strings; each string is a human-readable label
     num_shards: integer number of shards for this data set.
   """
-  assert len(filenames) == len(synsets)
+  assert len(filenames) == len(texts)
   assert len(filenames) == len(labels)
-  assert len(filenames) == len(humans)
 
   # Break all images into batches with a [ranges[i][0], ranges[i][1]].
   spacing = np.linspace(0, len(filenames), FLAGS.num_threads + 1).astype(np.int)
   ranges = []
-  threads = []
-  for i in xrange(len(spacing) - 1):
-    ranges.append([spacing[i], spacing[i+1]])
+  for i in range(len(spacing) - 1):
+    ranges.append([spacing[i], spacing[i + 1]])
 
   # Launch a thread for each batch.
   print('Launching %d threads for spacings: %s' % (FLAGS.num_threads, ranges))
@@ -424,10 +318,10 @@ def _process_image_files_auto(name, filenames, synsets, labels, humans,
   coder = ImageCoder()
 
   threads = []
-  for thread_index in xrange(len(ranges)):
+  for thread_index in range(len(ranges)):
     args = (coder, thread_index, ranges, name, filenames,
-            synsets, labels, humans, num_shards)
-    t = threading.Thread(target=_process_image_files_batch_auto, args=args)
+            texts, labels, num_shards)
+    t = threading.Thread(target=_process_image_files_batch, args=args)
     t.start()
     threads.append(t)
 
@@ -437,66 +331,62 @@ def _process_image_files_auto(name, filenames, synsets, labels, humans,
         (datetime.now(), len(filenames)))
   sys.stdout.flush()
 
+
 def _find_image_files(data_dir, labels_file):
   """Build a list of all images files and labels in the data set.
 
   Args:
     data_dir: string, path to the root directory of images.
 
-      Assumes that the ImageNet data set resides in JPEG files located in
+      Assumes that the image data set resides in JPEG files located in
       the following directory structure.
 
-        data_dir/n01440764/ILSVRC2012_val_00000293.JPEG
-        data_dir/n01440764/ILSVRC2012_val_00000543.JPEG
+        data_dir/dog/another-image.JPEG
+        data_dir/dog/my-image.jpg
 
-      where 'n01440764' is the unique synset label associated with these images.
+      where 'dog' is the label associated with these images.
 
     labels_file: string, path to the labels file.
 
       The list of valid labels are held in this file. Assumes that the file
       contains entries as such:
-        n01440764
-        n01443537
-        n01484850
-      where each line corresponds to a label expressed as a synset. We map
-      each synset contained in the file to an integer (based on the alphabetical
-      ordering) starting with the integer 1 corresponding to the synset
-      contained in the first line.
-
-      The reason we start the integer labels at 1 is to reserve label 0 as an
-      unused background class.
+        dog
+        cat
+        flower
+      where each line corresponds to a label. We map each label contained in
+      the file to an integer starting with the integer 0 corresponding to the
+      label contained in the first line.
 
   Returns:
     filenames: list of strings; each string is a path to an image file.
-    synsets: list of strings; each string is a unique WordNet ID.
+    texts: list of strings; each string is the class, e.g. 'dog'
     labels: list of integer; each integer identifies the ground truth.
   """
   print('Determining list of input files and labels from %s.' % data_dir)
-  challenge_synsets = [l.strip() for l in
-                       tf.gfile.FastGFile(labels_file, 'r').readlines()]
+  unique_labels = [l.strip() for l in tf.gfile.FastGFile(
+      labels_file, 'r').readlines()]
 
   labels = []
   filenames = []
-  synsets = []
+  texts = []
 
   # Leave label index 0 empty as a background class.
   label_index = 1
 
   # Construct the list of JPEG files and labels.
-  for synset in challenge_synsets:
-    # 不存在的跳过
-    if not os.path.isdir(os.path.join(data_dir, synset)):
+  for text in unique_labels:
+    if not os.path.isdir(os.path.join(data_dir, text)):
       continue
-    jpeg_file_path = '%s/%s/*' % (data_dir, synset)
+    jpeg_file_path = '%s/%s/*' % (data_dir, text)
     matching_files = tf.gfile.Glob(jpeg_file_path)
 
     labels.extend([label_index] * len(matching_files))
-    synsets.extend([synset] * len(matching_files))
+    texts.extend([text] * len(matching_files))
     filenames.extend(matching_files)
 
     if not label_index % 100:
       print('Finished finding files in %d of %d classes.' % (
-          label_index, len(challenge_synsets)))
+          label_index, len(labels)))
     label_index += 1
 
   # Shuffle the ordering of all image files in order to guarantee
@@ -507,78 +397,25 @@ def _find_image_files(data_dir, labels_file):
   random.shuffle(shuffled_index)
 
   filenames = [filenames[i] for i in shuffled_index]
-  synsets = [synsets[i] for i in shuffled_index]
+  texts = [texts[i] for i in shuffled_index]
   labels = [labels[i] for i in shuffled_index]
 
   print('Found %d JPEG files across %d labels inside %s.' %
-        (len(filenames), len(challenge_synsets), data_dir))
-  return filenames, synsets, labels
+        (len(filenames), len(unique_labels), data_dir))
+  return filenames, texts, labels
 
 
-def _find_human_readable_labels(synsets, synset_to_human):
-  """Build a list of human-readable labels.
-
-  Args:
-    synsets: list of strings; each string is a unique WordNet ID.
-    synset_to_human: dict of synset to human labels, e.g.,
-      'n02119022' --> 'red fox, Vulpes vulpes'
-
-  Returns:
-    List of human-readable strings corresponding to each synset.
-  """
-  humans = []
-  for s in synsets:
-    assert s in synset_to_human, ('Failed to find: %s' % s)
-    humans.append(synset_to_human[s])
-  return humans
-
-
-def _process_dataset_auto(name, directory, num_shards, synset_to_human):
+def _process_dataset(name, directory, num_shards, labels_file):
   """Process a complete data set and save it as a TFRecord.
 
   Args:
     name: string, unique identifier specifying the data set.
     directory: string, root path to the data set.
     num_shards: integer number of shards for this data set.
-    synset_to_human: dict of synset to human labels, e.g.,
-      'n02119022' --> 'red fox, Vulpes vulpes'
+    labels_file: string, path to the labels file.
   """
-  filenames, synsets, labels = _find_image_files(directory, FLAGS.labels_file)
-  humans = _find_human_readable_labels(synsets, synset_to_human)
-  _process_image_files_auto(name, filenames, synsets, labels,
-                       humans, num_shards)
-
-def _build_synset_lookup(imagenet_metadata_file):
-  """Build lookup for synset to human-readable label.
-
-  Args:
-    imagenet_metadata_file: string, path to file containing mapping from
-      synset to human-readable label.
-
-      Assumes each line of the file looks like:
-
-        n02119247    black fox
-        n02119359    silver fox
-        n02119477    red fox, Vulpes fulva
-
-      where each line corresponds to a unique mapping. Note that each line is
-      formatted as <synset>\t<human readable label>.
-
-  Returns:
-    Dictionary of synset to human labels, such as:
-      'n02119022' --> 'red fox, Vulpes vulpes'
-  """
-  lines = tf.gfile.FastGFile(imagenet_metadata_file, 'r').readlines()
-  synset_to_human = {}
-  for l in lines:
-    if l:
-      parts = l.strip().split('\t')
-      assert len(parts) == 2
-      synset = parts[0]
-      human = parts[1]
-      synset_to_human[synset] = human
-  return synset_to_human
-
+  filenames, texts, labels = _find_image_files(directory, labels_file)
+  _process_image_files(name, filenames, texts, labels, num_shards)
 
 
 def main(unused_argv):
@@ -587,19 +424,13 @@ def main(unused_argv):
   assert not FLAGS.validation_shards % FLAGS.num_threads, (
       'Please make the FLAGS.num_threads commensurate with '
       'FLAGS.validation_shards')
-  if not os.path.isdir(FLAGS.output_directory):
-    os.makedirs(FLAGS.output_directory)
   print('Saving results to %s' % FLAGS.output_directory)
 
-  # Build a map from synset to human-readable label.
-  synset_to_human = _build_synset_lookup(FLAGS.imagenet_metadata_file)
-
   # Run it!
-  _process_dataset_auto('validation', FLAGS.validation_directory,
-                   FLAGS.validation_shards, synset_to_human)
-  # 由于未生成训练数据，所以先只生成测试数据
-  _process_dataset_auto('train', FLAGS.train_directory, FLAGS.train_shards,
-                   synset_to_human)
+  _process_dataset('validation', FLAGS.validation_directory,
+                   FLAGS.validation_shards, FLAGS.labels_file)
+  # _process_dataset('train', FLAGS.train_directory,
+  #                  FLAGS.train_shards, FLAGS.labels_file)
 
 
 if __name__ == '__main__':

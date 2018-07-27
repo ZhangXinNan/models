@@ -23,6 +23,8 @@ from datasets import flowers
 from datasets import imagenet
 from datasets import mnist
 from datasets import auto
+from datasets import imagenet_flowers
+from datasets import imagenet_auto
 
 datasets_map = {
     'cifar10': cifar10,
@@ -30,6 +32,8 @@ datasets_map = {
     'imagenet': imagenet,
     'mnist': mnist,
     'auto': auto,
+    'imagenet_flowers': imagenet_flowers,
+    'imagenet_auto': imagenet_auto,
 }
 
 

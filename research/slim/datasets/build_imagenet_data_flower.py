@@ -202,7 +202,7 @@ def _convert_to_example_flower(filename, image_buffer, label, synset, human,
       'image/channels': _int64_feature(channels),
       'image/class/label': _int64_feature(label),
       # 'image/class/synset': _bytes_feature(synset), # TypeError: 'tulips' has type str, but expected one of: bytes
-      'image/class/synset': _bytes_feature(tf.compat.as_bytes(synset)),
+      # 'image/class/synset': _bytes_feature(tf.compat.as_bytes(synset)),
       'image/class/text': _bytes_feature(tf.compat.as_bytes(human)),
       'image/format': _bytes_feature(tf.compat.as_bytes(image_format)),
       'image/filename': _bytes_feature(tf.compat.as_bytes(os.path.basename(filename))),
