@@ -45,7 +45,7 @@ _FILE_PATTERN = '%s-*'
 
 _SPLITS_TO_SIZES = {
     'train': 2830000,
-    'validation': 2000, #4385,
+    'validation': 4385,
 }
 
 _ITEMS_TO_DESCRIPTIONS = {

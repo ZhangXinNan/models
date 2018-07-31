@@ -24,6 +24,8 @@ from datasets import dataset_factory_auto as dataset_factory
 from deployment import model_deploy
 from nets import nets_factory
 from preprocessing import preprocessing_factory
+import win_unicode_console
+win_unicode_console.enable()
 
 slim = tf.contrib.slim
 

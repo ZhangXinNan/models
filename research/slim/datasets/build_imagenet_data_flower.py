@@ -590,6 +590,8 @@ def main(unused_argv):
   assert not FLAGS.validation_shards % FLAGS.num_threads, (
       'Please make the FLAGS.num_threads commensurate with '
       'FLAGS.validation_shards')
+  if not os.path.isdir(FLAGS.output_directory):
+    os.makedirs(FLAGS.output_directory)
   print('Saving results to %s' % FLAGS.output_directory)
 
   # Build a map from synset to human-readable label.

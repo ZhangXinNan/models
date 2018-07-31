@@ -95,6 +95,8 @@ import threading
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
+import win_unicode_console
+win_unicode_console.enable()
 
 
 tf.app.flags.DEFINE_string('train_directory', '/tmp/',
@@ -104,7 +106,7 @@ tf.app.flags.DEFINE_string('validation_directory', '/tmp/',
 tf.app.flags.DEFINE_string('output_directory', '/tmp/',
                            'Output data directory')
 
-tf.app.flags.DEFINE_integer('train_shards', 256,
+tf.app.flags.DEFINE_integer('train_shards', 1024,
                             'Number of shards in training TFRecord files.')
 tf.app.flags.DEFINE_integer('validation_shards', 16,
                             'Number of shards in validation TFRecord files.')
@@ -598,8 +600,8 @@ def main(unused_argv):
   _process_dataset_auto('validation', FLAGS.validation_directory,
                    FLAGS.validation_shards, synset_to_human)
   # 由于未生成训练数据，所以先只生成测试数据
-  _process_dataset_auto('train', FLAGS.train_directory, FLAGS.train_shards,
-                   synset_to_human)
+  # _process_dataset_auto('train', FLAGS.train_directory, FLAGS.train_shards,
+  #                  synset_to_human)
 
 
 if __name__ == '__main__':
