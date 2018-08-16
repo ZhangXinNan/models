@@ -67,6 +67,7 @@ python eval_image_classifier_auto.py `
 # eval/Accuracy[0.81]
 # eval/Recall_5[1]
 # eval/Recall_5[1]eval/Accuracy[0.74]
+# eval/Accuracy[0.763333321]eval/Recall_5[1]
 ```
 
 
