@@ -51,9 +51,9 @@ python download_and_convert_data.py \
   --dataset_dir=${DATASET_DIR}
 
 
-DATASET_DIR=/media/zhangxin/DATA/data_public/slim_flower
-TRAIN_DIR=/media/zhangxin/DATA/data_public/slim_flower/models_v4
-PRETRAINED_CHECKPOINT_DIR=/media/zhangxin/DATA/data_public/googlenet
+DATASET_DIR=/media/alex/DATA/data_public/slim_flower
+TRAIN_DIR=/media/alex/DATA/data_public/slim_flower/models_v4
+PRETRAINED_CHECKPOINT_DIR=/media/alex/DATA/data_public/googlenet
 # Fine-tune only the new layers for 1000 steps.
 python train_image_classifier.py \
   --train_dir=${TRAIN_DIR} \
